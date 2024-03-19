@@ -237,7 +237,7 @@ class GradCache:
                 with state:
                     y = self.model_call(model, x)
                 reps = self.get_reps(y)
-                #asdf
+
                 surrogate = torch.dot(reps.flatten(), gradient.flatten())
                 surrogate.backward()
 

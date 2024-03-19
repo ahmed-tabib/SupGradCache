@@ -1,63 +1,112 @@
-from typing import Callable
+# Copyright 2023 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import torch
-from torch import Tensor
-from torch.nn import functional as F
-from torch import distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.distributed.nn
+
+# instead of this
+#from util import misc
+# we import the function and use it directly
+def get_rank():
+    if not is_dist_avail_and_initialized():
+        return 0
+    return dist.get_rank()
 
 
-class SimpleContrastiveLoss:
-    def __init__(self, n_hard_negatives: int = 0):
-        self.target_per_qry = n_hard_negatives + 1
-
-    def __call__(self, x: Tensor, y: Tensor, target: Tensor = None, reduction: str = 'mean'):
-        if target is None:
-            assert x.size(0) * self.target_per_qry == y.size(0)
-            target = torch.arange(0, x.size(0) * self.target_per_qry, self.target_per_qry, device=x.device)
-
-        logits = torch.matmul(x, y.transpose(0, 1))
-        return F.cross_entropy(logits, target, reduction=reduction)
+def compute_cross_entropy(p, q):
+    q = F.log_softmax(q, dim=-1)
+    loss = torch.sum(p * q, dim=-1)
+    return - loss.mean()
 
 
-class DistributedContrastiveLoss(SimpleContrastiveLoss):
-    def __init__(self, n_hard_negatives: int = 0):
-        assert dist.is_initialized(), "Distributed training has not been properly initialized."
-
-        super().__init__(n_hard_negatives=n_hard_negatives)
-        self.word_size = dist.get_world_size()
-        self.rank = dist.get_rank()
-
-    def __call__(self, x: Tensor, y: Tensor, **kwargs):
-        dist_x = self.gather_tensor(x)
-        dist_y = self.gather_tensor(y)
-
-        return super().__call__(dist_x, dist_y, **kwargs)
-
-    def gather_tensor(self, t):
-        gathered = [torch.empty_like(t) for _ in range(self.word_size)]
-        dist.all_gather(gathered, t)
-        gathered[self.rank] = t
-        return torch.cat(gathered, dim=0)
+def stablize_logits(logits):
+    logits_max, _ = torch.max(logits, dim=-1, keepdim=True)
+    logits = logits - logits_max.detach()
+    return logits
 
 
-class ContrastiveLossWithQueryClosure(SimpleContrastiveLoss):
-    def __call__(
-            self,
-            *reps: Tensor,
-            query_closure: Callable[[], Tensor] = None,
-            target: Tensor = None,
-            reduction: str = 'mean'
-    ):
-        if len(reps) == 0 or len(reps) > 2:
-            raise ValueError(f'Expecting 1 or 2 tensor input, got {len(reps)} tensors')
+@torch.no_grad()
+def concat_all_gather(tensor):
+    """
+    Performs all_gather operation on the provided tensors.
+    *** Warning ***: torch.distributed.all_gather has no gradient.
+    """
+    tensors_gather = [torch.ones_like(tensor)
+                      for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
 
-        # no closure evaluation
-        if len(reps) == 2:
-            assert query_closure is None, 'received 2 representation tensors while query_closure is also set'
-            return super().__call__(*reps, target=target, reduction=reduction)
+    output = torch.cat(tensors_gather, dim=0)
+    return output
 
-        # run the closure
-        assert query_closure is not None
-        x = query_closure()
-        y = reps[0]
-        return super().__call__(x, y, target=target, reduction=reduction)
+
+class MultiPosConLoss(nn.Module):
+    """
+    Multi-Positive Contrastive Loss: https://arxiv.org/pdf/2306.00984.pdf
+    """
+
+    def __init__(self, temperature=0.1):
+        super(MultiPosConLoss, self).__init__()
+        self.temperature = temperature
+        self.logits_mask = None
+        self.mask = None
+        self.last_local_batch_size = None
+
+    def set_temperature(self, temp=0.1):
+        self.temperature = temp
+
+    def forward(self, features, labels):
+        feats = features    # feats shape: [B, D]
+        #labels = outputs['labels']    # labels shape: [B]
+
+        device = (torch.device('cuda')
+                  if feats.is_cuda
+                  else torch.device('cpu'))
+
+        feats = F.normalize(feats, dim=-1, p=2)
+        local_batch_size = feats.size(0)
+
+        all_feats = torch.cat(torch.distributed.nn.all_gather(feats), dim=0)
+        all_labels = concat_all_gather(labels)  # no gradient gather
+
+        # compute the mask based on labels
+        if local_batch_size != self.last_local_batch_size:
+            mask = torch.eq(labels.view(-1, 1),
+                            all_labels.contiguous().view(1, -1)).float().to(device)
+            self.logits_mask = torch.scatter(
+                torch.ones_like(mask),
+                1,
+                torch.arange(mask.shape[0]).view(-1, 1).to(device) +
+                local_batch_size * get_rank(),
+                0
+            )
+
+            self.last_local_batch_size = local_batch_size
+            self.mask = mask * self.logits_mask
+
+        mask = self.mask
+
+        # compute logits
+        logits = torch.matmul(feats, all_feats.T) / self.temperature
+        logits = logits - (1 - self.logits_mask) * 1e9
+
+        # optional: minus the largest logit to stablize logits
+        logits = stablize_logits(logits)
+
+        # compute ground-truth distribution
+        p = mask / mask.sum(1, keepdim=True).clamp(min=1.0)
+        loss = compute_cross_entropy(p, logits)
+
+        return {'loss': loss, 'image_loss': loss}
