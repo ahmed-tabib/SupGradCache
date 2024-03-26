@@ -109,4 +109,4 @@ class MultiPosConLoss(nn.Module):
         p = mask / mask.sum(1, keepdim=True).clamp(min=1.0)
         loss = compute_cross_entropy(p, logits)
 
-        return {'loss': loss, 'image_loss': loss}
+        return loss
