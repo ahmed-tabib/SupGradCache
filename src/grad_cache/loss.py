@@ -78,8 +78,8 @@ class MultiPosConLoss(nn.Module):
         feats = F.normalize(feats, dim=-1, p=2)
         local_batch_size = feats.size(0)
 
-        all_feats = torch.cat(torch.distributed.nn.all_gather(feats), dim=0)
-        all_labels = concat_all_gather(labels)  # no gradient gather
+        all_feats = feats #torch.cat(torch.distributed.nn.all_gather(feats), dim=0)
+        all_labels = labels #concat_all_gather(labels)  # no gradient gather
 
         # compute the mask based on labels
         if local_batch_size != self.last_local_batch_size:
