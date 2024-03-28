@@ -21,9 +21,7 @@ import torch.distributed.nn
 #from util import misc
 # we import the function and use it directly
 def get_rank():
-    if not is_dist_avail_and_initialized():
-        return 0
-    return dist.get_rank()
+    return 0
 
 
 def compute_cross_entropy(p, q):
